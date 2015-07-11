@@ -59,13 +59,19 @@ typedef enum ring_buffer_flags_e
 	FLAG_INVALID_JOB = 4
 } ring_buffer_flags_e;
 
+typedef enum thread_pool_policy_e
+{
+	POLICY_SLEEP = 0,
+	POLICY_SPIN = 1
+} thread_pool_policy_e;
+
+struct thread_pool_t;
 struct thread_pool_worker_t
 {
-	int                  timer;       /* counters for each thread - used for work balancing - use atomics to modify */
-	pthread_t            thread;      /* vector of worker thread handles */
-	pthread_cond_t       wakeup_cv;   /* condition variables for waking up a worker thread - lock worker_mutex for access */
-	pthread_mutex_t      mutex;       /* locks for worker_wakeup_cv */
-	struct ring_buffer_t ring_buffer; /* ring buffers for storing jobs, 1 for each thread */
+	int                   timer;       /* counters for each thread - used for work balancing - use atomics to modify */
+	pthread_t             thread;      /* vector of worker thread handles */
+	pthread_cond_t        wakeup_cv;   /* condition variables for waking up a worker thread - lock worker_mutex for access */
+	struct ring_buffer_t  ring_buffer; /* ring buffers for storing jobs, 1 for each thread */
 	struct thread_pool_t* pool;       /* the pool that owns this worker */
 };
 
@@ -75,6 +81,7 @@ struct thread_pool_t
 	int             active_jobs;        /* number of active jobs - use atomics to modify */
 	int             selected_worker;    /* index of the worker to give an incoming job - NOTE: doesn't wrap, use modulo - use atomics to modify */
 	char            active;             /* whether or not the pool is active - use atomics to modify */
+	char            never_sleep;        /* when non-zero, idle workers will spinlock */
 
 	struct thread_pool_worker_t* worker;/* vector of workers */
 
@@ -113,6 +120,10 @@ thread_pool_queue_range(struct thread_pool_t* pool,
 						thread_pool_job_func job,
 						thread_pool_yield_param_func yield_param,
 						int begin, int end);
+
+void
+thread_pool_set_idle_worker_policy(struct thread_pool_t* pool,
+								   thread_pool_policy_e policy);
 
 void
 thread_pool_suspend(struct thread_pool_t* pool);
