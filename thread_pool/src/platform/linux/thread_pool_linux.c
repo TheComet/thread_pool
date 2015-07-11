@@ -273,8 +273,6 @@ thread_pool_queue_range(struct thread_pool_t* pool,
 	}
 }
 
-static int invalid_jobs = 0;
-
 /* ------------------------------------------------------------------------- */
 void
 thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* data)
@@ -339,8 +337,7 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 		 * this job as invalid. The worker thread will have no knowledge of
 		 * this job ever existing.
 		 */
-		__sync_add_and_fetch(&invalid_jobs, 1);
-		__sync_lock_test_and_set(flag_ptr, FLAG_INVALID_JOB);
+		__sync_bool_compare_and_swap(flag_ptr, FLAG_FREE_SLOT, FLAG_INVALID_JOB);
 	}
 	else
 	{
@@ -361,12 +358,9 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 
 	/* wake up worker - this must happen regardless of whether the job is valid
 	 * or not */
-	if(!pool->never_sleep)
-	{
-		pthread_mutex_lock(&pool->mutex);
-		pthread_cond_signal(&pool->worker[selected_worker].wakeup_cv);
-		pthread_mutex_unlock(&pool->mutex);
-	}
+	pthread_mutex_lock(&pool->mutex);
+	pthread_cond_signal(&pool->worker[selected_worker].wakeup_cv);
+	pthread_mutex_unlock(&pool->mutex);
 }
 
 /* ------------------------------------------------------------------------- */
@@ -421,19 +415,14 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 			 *
 			 * If never_sleep is set to true, we spin instead of sleep.
 			 */
-			if(worker->pool->never_sleep)
-				pthread_mutex_unlock(&worker->pool->mutex);
-
 			while(__sync_fetch_and_add(&worker->pool->active, 0) &&
 			     !__sync_bool_compare_and_swap(flag_ptr, FLAG_FILLED_SLOT, FLAG_READ_IN_PROGRESS) &&
 			     !(__sync_fetch_and_add(flag_ptr, 0) == FLAG_INVALID_JOB))
 			{
-				if(!worker->pool->never_sleep)
-					pthread_cond_wait(&worker->wakeup_cv, &worker->pool->mutex);
+				pthread_cond_wait(&worker->wakeup_cv, &worker->pool->mutex);
 			}
 
-			if(!worker->pool->never_sleep)
-				pthread_mutex_unlock(&worker->pool->mutex);
+			pthread_mutex_unlock(&worker->pool->mutex);
 
 			/* was the job invalid? */
 			if(__sync_bool_compare_and_swap(flag_ptr, FLAG_INVALID_JOB, FLAG_FREE_SLOT))

@@ -3,7 +3,7 @@
 #define MALLOC malloc
 #define FREE free
 
-#define RING_BUFFER_DEFAULT_SLOT_COUNT 256
+#define RING_BUFFER_DEFAULT_SLOT_COUNT 4
 
 #ifdef DATA_POINTER_TYPE
 #   undef DATA_POINTER_TYPE
