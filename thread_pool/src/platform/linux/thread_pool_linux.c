@@ -152,6 +152,7 @@ thread_pool_init_worker(struct thread_pool_worker_t* worker,
 							job_slots,
 							sizeof worker->ring_buffer);
 
+	pthread_mutex_init(&worker->mutex, NULL);
 	pthread_cond_init(&worker->wakeup_cv, NULL);
 }
 
@@ -160,6 +161,7 @@ static void
 thread_pool_deinit_worker(struct thread_pool_worker_t* worker)
 {
 	pthread_cond_destroy(&worker->wakeup_cv);
+	pthread_mutex_destroy(&worker->mutex);
 
 	ring_buffer_deinit_buffer(&worker->ring_buffer);
 }
@@ -353,14 +355,17 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 
 		/* buffer is ready for reading, update flag */
 		__sync_add_and_fetch(&pool->active_jobs, 1);
-		__sync_lock_test_and_set(flag_ptr, FLAG_FILLED_SLOT);
+		__sync_bool_compare_and_swap(flag_ptr, FLAG_WRITE_IN_PROGRESS, FLAG_FILLED_SLOT);
 	}
 
 	/* wake up worker - this must happen regardless of whether the job is valid
 	 * or not */
-	pthread_mutex_lock(&pool->mutex);
-	pthread_cond_signal(&pool->worker[selected_worker].wakeup_cv);
-	pthread_mutex_unlock(&pool->mutex);
+	if(!pool->never_sleep)
+	{
+		pthread_mutex_lock(&pool->worker[selected_worker].mutex);
+		pthread_cond_signal(&pool->worker[selected_worker].wakeup_cv);
+		pthread_mutex_unlock(&pool->worker[selected_worker].mutex);
+	}
 }
 
 /* ------------------------------------------------------------------------- */
@@ -396,14 +401,16 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 		 */
 		if(!__sync_bool_compare_and_swap(flag_ptr, FLAG_FILLED_SLOT, FLAG_READ_IN_PROGRESS))
 		{
-			/* signal that a job has been finished - even if it was invalid */
+			/* signal that a job has been finished - even if it was invalid, so
+			 * waiting threads don't get locked up if the last job was an
+			 * invalid job */
 			pthread_mutex_lock(&worker->pool->mutex);
 			pthread_cond_broadcast(&worker->pool->job_finished_cv);
+			pthread_mutex_unlock(&worker->pool->mutex);
 
 			/* it could be an invalid job? Just unlock and get the next job */
 			if(__sync_bool_compare_and_swap(flag_ptr, FLAG_INVALID_JOB, FLAG_FREE_SLOT))
 			{
-				pthread_mutex_unlock(&worker->pool->mutex);
 				continue;
 			}
 
@@ -415,18 +422,23 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 			 *
 			 * If never_sleep is set to true, we spin instead of sleep.
 			 */
+			if(!worker->pool->never_sleep)
+				pthread_mutex_lock(&worker->mutex);
 			while(__sync_fetch_and_add(&worker->pool->active, 0) &&
 			     !__sync_bool_compare_and_swap(flag_ptr, FLAG_FILLED_SLOT, FLAG_READ_IN_PROGRESS) &&
 			     !(__sync_fetch_and_add(flag_ptr, 0) == FLAG_INVALID_JOB))
 			{
-				pthread_cond_wait(&worker->wakeup_cv, &worker->pool->mutex);
+				if(!worker->pool->never_sleep)
+					pthread_cond_wait(&worker->wakeup_cv, &worker->mutex);
 			}
-
-			pthread_mutex_unlock(&worker->pool->mutex);
+			if(!worker->pool->never_sleep)
+				pthread_mutex_unlock(&worker->mutex);
 
 			/* was the job invalid? */
 			if(__sync_bool_compare_and_swap(flag_ptr, FLAG_INVALID_JOB, FLAG_FREE_SLOT))
+			{
 				continue;
+			}
 
 			/* if the pool is no longer active, don't process the job */
 			if(!__sync_fetch_and_add(&worker->pool->active, 0))
@@ -452,12 +464,14 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 
 		/* job done, flag as free slot */
 		__sync_sub_and_fetch(&worker->pool->active_jobs, 1);
-		__sync_lock_test_and_set(flag_ptr, FLAG_FREE_SLOT);
+		__sync_bool_compare_and_swap(flag_ptr, FLAG_READ_IN_PROGRESS, FLAG_FREE_SLOT);
 	}
 
+	/* wake up any threads waiting for job completion */
 	pthread_mutex_lock(&worker->pool->mutex);
 	pthread_cond_broadcast(&worker->pool->job_finished_cv);
 	pthread_mutex_unlock(&worker->pool->mutex);
+
 	printf("[threadpool] Worker exiting on thread 0x%lx\n",
 		   (intptr_t)pthread_self());
 	pthread_exit(NULL);

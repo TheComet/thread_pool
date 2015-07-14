@@ -1,4 +1,5 @@
 #include "pstdint.h"
+#include <stdio.h>
 
 #define MALLOC malloc
 #define FREE free
@@ -70,9 +71,10 @@ struct thread_pool_worker_t
 {
 	int                   timer;       /* counters for each thread - used for work balancing - use atomics to modify */
 	pthread_t             thread;      /* vector of worker thread handles */
+	pthread_mutex_t       mutex;       /* worker mutex for wakeup condition */
 	pthread_cond_t        wakeup_cv;   /* condition variables for waking up a worker thread - lock worker_mutex for access */
 	struct ring_buffer_t  ring_buffer; /* ring buffers for storing jobs, 1 for each thread */
-	struct thread_pool_t* pool;       /* the pool that owns this worker */
+	struct thread_pool_t* pool;        /* the pool that owns this worker */
 };
 
 struct thread_pool_t

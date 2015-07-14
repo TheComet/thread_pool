@@ -20,13 +20,13 @@ int main()
 {
 	int i;
 	clock_t start;
-	struct thread_pool_t* pool = thread_pool_create(2, 0);
-	/*thread_pool_set_idle_worker_policy(pool, POLICY_SPIN);*/
+	struct thread_pool_t* pool = thread_pool_create(0, 0);
+	thread_pool_set_idle_worker_policy(pool, POLICY_SPIN);
 
 	start = clock();
-	for(i = 0; i != 100000; ++i)
+	for(i = 0; i != 1000000; ++i)
 		thread_pool_queue(pool, (thread_pool_job_func)work, NULL);
-	printf("Elapsed time: %.2f.\n", (clock() - start)/(double)CLOCKS_PER_SEC);
+	printf("Elapsed time: %.2f.\n", (clock() - start) * 0.000001);
 	thread_pool_wait_for_jobs(pool);
 	thread_pool_destroy(pool);
 
