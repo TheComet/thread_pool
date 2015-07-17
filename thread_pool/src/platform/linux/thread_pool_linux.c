@@ -303,15 +303,16 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 	 * which to insert a new job.
 	 */
 	pthread_spin_lock(&pool->queue_lock);
-	if(ring_buffer->write_pos == __sync_fetch_and_add(&ring_buffer->read_pos, 0) + 1)
+	if(ring_buffer->write_pos % ring_buffer->job_slots + 2 ==
+	   __sync_fetch_and_add(&ring_buffer->read_pos, 0) % ring_buffer->job_slots)
 	{
 		pthread_spin_unlock(&pool->queue_lock);
 		func(data);
 		return;
-	} else {
-		write_pos = ring_buffer->write_pos++ % ring_buffer->job_slots;
-		pthread_spin_unlock(&pool->queue_lock);
 	}
+
+	write_pos = ring_buffer->write_pos++ % ring_buffer->job_slots;
+	pthread_spin_unlock(&pool->queue_lock);
 
 	/* cache flag buffer pointer, it's used multiple times */
 	flag_ptr = ring_buffer->flg_buffer + write_pos;
@@ -329,8 +330,8 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 	 * Flag has been set to "write in progress", so the job can now be safely
 	 * copied into the target buffer.
 	 */
-	job = (struct thread_pool_job_t*)(ring_buffer->obj_buffer +
-			write_pos * ring_buffer->job_size_in_bytes);
+	job = (struct thread_pool_job_t*)
+		(ring_buffer->obj_buffer + write_pos * ring_buffer->job_size_in_bytes);
 
 	job->func = func;
 	job->data = data;
