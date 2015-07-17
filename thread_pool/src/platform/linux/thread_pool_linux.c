@@ -202,6 +202,7 @@ thread_pool_init_pool(struct thread_pool_t* pool,
 	}
 
 	/* conditional variable and mutex for when workers go to sleep */
+	pthread_spin_init(&pool->queue_lock, PTHREAD_PROCESS_PRIVATE);
 	pthread_mutex_init(&pool->mutex, NULL);
 	pthread_cond_init(&pool->job_finished_cv, NULL);
 
@@ -220,6 +221,7 @@ thread_pool_destroy(struct thread_pool_t* pool)
 
 	pthread_cond_destroy(&pool->job_finished_cv);
 	pthread_mutex_destroy(&pool->mutex);
+	pthread_spin_destroy(&pool->queue_lock);
 
 	for(i = 0; i != pool->num_threads; ++i)
 	{
@@ -285,8 +287,12 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 	struct ring_buffer_t* ring_buffer;
 	DATA_POINTER_TYPE* flag_ptr;
 
-	/* Get target worker: This is some primitive load balancing but should work for now */
-	selected_worker = __sync_fetch_and_add(&pool->selected_worker, 1) % pool->num_threads;
+	/*
+	 * Get target worker: This is some primitive load balancing but should work
+	 * for now.
+	 */
+	selected_worker = __sync_fetch_and_add(&pool->selected_worker, 1) %
+			pool->num_threads;
 
 	/* get the worker thread's ring buffer */
 	ring_buffer = &pool->worker[selected_worker].ring_buffer;
@@ -296,70 +302,47 @@ thread_pool_queue(struct thread_pool_t* pool, thread_pool_job_func func, void* d
 	 * operation will acquire an unused, unique position in the ring buffer in
 	 * which to insert a new job.
 	 */
-	write_pos = __sync_fetch_and_add(&ring_buffer->write_pos, 1) %
-			ring_buffer->job_slots;
+	pthread_spin_lock(&pool->queue_lock);
+	if(ring_buffer->write_pos == __sync_fetch_and_add(&ring_buffer->read_pos, 0) + 1)
+	{
+		pthread_spin_unlock(&pool->queue_lock);
+		func(data);
+		return;
+	} else {
+		write_pos = ring_buffer->write_pos++ % ring_buffer->job_slots;
+		pthread_spin_unlock(&pool->queue_lock);
+	}
 
 	/* cache flag buffer pointer, it's used multiple times */
 	flag_ptr = ring_buffer->flg_buffer + write_pos;
 
 	/*
 	 * Try to set the flag to "write in progress" in flag buffer. This
-	 * operation will fail if the current flag is not FLAG_FREE_SLOT and will mean
-	 * the buffer has overflown.
+	 * operation will fail if the current flag is not FLAG_FREE_SLOT and will
+	 * mean the buffer has overflown.
 	 */
-	if(!__sync_bool_compare_and_swap(flag_ptr, FLAG_FREE_SLOT, FLAG_WRITE_IN_PROGRESS))
+	while(!__sync_bool_compare_and_swap(flag_ptr, FLAG_FREE_SLOT, FLAG_WRITE_IN_PROGRESS))
 	{
-		/*
-		 * The buffer has overflown.
-		 *
-		 * At this point there are two possible things that have happened.
-		 *  1) The job at write_pos is pending to be executed by the thread
-		 *     we're currently in. Spin-locking until the job is free would
-		 *     result in a deadlock and is therefore not an option.
-		 *  2) The job at write_pos is pending or currently being processed by
-		 *     another thread, in which case it would be possible to wait
-		 *     until the slot frees up.
-		 *
-		 * The easiest thing to do here is to execute this job directly.
-		 */
-		func(data);
-
-		/*
-		 * If in the meantime the job at write_pos has completed (and maybe
-		 * there are even more jobs queued up after write_pos, which is
-		 * entirely possible seeing as any proceeding calls to this function
-		 * will acquire a write_pos after this one), the thread which processed
-		 * the job will be dependent on the state of this job.
-		 *
-		 * We have an obligation to mark this slot as "invalid" - indicating
-		 * that this job slot has already been executed - and informing the
-		 * worker thread about it.
-		 *
-		 * If the job is still being processed then there is no need to set
-		 * this job as invalid. The worker thread will have no knowledge of
-		 * this job ever existing.
-		 */
-		__sync_bool_compare_and_swap(flag_ptr, FLAG_FREE_SLOT, FLAG_INVALID_JOB);
-	}
-	else
-	{
-		/*
-		 * Flag has been set to "write in progress", so the job can now be safely
-		 * copied into the target buffer.
-		 */
-		job = (struct thread_pool_job_t*)(ring_buffer->obj_buffer +
-				write_pos * ring_buffer->job_size_in_bytes);
-
-		job->func = func;
-		job->data = data;
-
-		/* buffer is ready for reading, update flag */
-		__sync_add_and_fetch(&pool->active_jobs, 1);
-		__sync_bool_compare_and_swap(flag_ptr, FLAG_WRITE_IN_PROGRESS, FLAG_FILLED_SLOT);
 	}
 
-	/* wake up worker - this must happen regardless of whether the job is valid
-	 * or not */
+	/*
+	 * Flag has been set to "write in progress", so the job can now be safely
+	 * copied into the target buffer.
+	 */
+	job = (struct thread_pool_job_t*)(ring_buffer->obj_buffer +
+			write_pos * ring_buffer->job_size_in_bytes);
+
+	job->func = func;
+	job->data = data;
+
+	/* buffer is ready for reading, update flag */
+	__sync_add_and_fetch(&pool->active_jobs, 1);
+	__sync_bool_compare_and_swap(flag_ptr, FLAG_WRITE_IN_PROGRESS, FLAG_FILLED_SLOT);
+
+	/*
+	 * Wake up worker - this must happen regardless of whether the job was
+	 * successfully queued or not.
+	 */
 	if(!pool->never_sleep)
 	{
 		pthread_mutex_lock(&pool->worker[selected_worker].mutex);
@@ -374,8 +357,8 @@ static void*
 thread_pool_worker(struct thread_pool_worker_t* worker)
 {
 	struct thread_pool_job_t* job;
-	intptr_t read_pos;
 	DATA_POINTER_TYPE* flag_ptr;
+	uintptr_t read_pos;
 
 	printf("[threadpool] Worker started on thread 0x%lx\n",
 		   (intptr_t)pthread_self());
@@ -384,9 +367,9 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 	while(__sync_fetch_and_add(&worker->pool->active, 0))
 	{
 		/*
-		 * Fetch, increment and wrap read position of target ring buffer. This
-		 * operation will acquire a unique position in the ring buffer in which
-		 * to insert a new job.
+		 * Fetch, increment and wrap read position of target ring buffer. Since
+		 * the worker thread is the only one to ever access this variable,
+		 * it need not be atomic.
 		 */
 		read_pos = __sync_fetch_and_add(&worker->ring_buffer.read_pos, 1) %
 				worker->ring_buffer.job_slots;
@@ -395,24 +378,18 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 		flag_ptr = worker->ring_buffer.flg_buffer + read_pos;
 
 		/*
-		 * If the job at read_pos is filled, swap the flag with a
-		 * "read in progress". This operation will fail if there are no more
-		 * jobs.
+		 * If the job at read_pos isn't a filled slot, enter sleeping logic.
 		 */
-		if(!__sync_bool_compare_and_swap(flag_ptr, FLAG_FILLED_SLOT, FLAG_READ_IN_PROGRESS))
+		if(__sync_fetch_and_add(flag_ptr, 0) != FLAG_FILLED_SLOT)
 		{
-			/* signal that a job has been finished - even if it was invalid, so
+			/*
+			 * Signal that a job has been finished - even if it was invalid, so
 			 * waiting threads don't get locked up if the last job was an
-			 * invalid job */
+			 * invalid job.
+			 */
 			pthread_mutex_lock(&worker->pool->mutex);
 			pthread_cond_broadcast(&worker->pool->job_finished_cv);
 			pthread_mutex_unlock(&worker->pool->mutex);
-
-			/* it could be an invalid job? Just unlock and get the next job */
-			if(__sync_bool_compare_and_swap(flag_ptr, FLAG_INVALID_JOB, FLAG_FREE_SLOT))
-			{
-				continue;
-			}
 
 			/*
 			 * Wait for wakeup signal.
@@ -424,9 +401,8 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 			 */
 			if(!worker->pool->never_sleep)
 				pthread_mutex_lock(&worker->mutex);
-			while(__sync_fetch_and_add(&worker->pool->active, 0) &&
-			     !__sync_bool_compare_and_swap(flag_ptr, FLAG_FILLED_SLOT, FLAG_READ_IN_PROGRESS) &&
-			     !(__sync_fetch_and_add(flag_ptr, 0) == FLAG_INVALID_JOB))
+			while(__sync_add_and_fetch(flag_ptr, 0) != FLAG_FILLED_SLOT &&
+			      __sync_add_and_fetch(&worker->pool->active, 0))
 			{
 				if(!worker->pool->never_sleep)
 					pthread_cond_wait(&worker->wakeup_cv, &worker->mutex);
@@ -434,24 +410,9 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 			if(!worker->pool->never_sleep)
 				pthread_mutex_unlock(&worker->mutex);
 
-			/* was the job invalid? */
-			if(__sync_bool_compare_and_swap(flag_ptr, FLAG_INVALID_JOB, FLAG_FREE_SLOT))
-			{
-				continue;
-			}
-
 			/* if the pool is no longer active, don't process the job */
 			if(!__sync_fetch_and_add(&worker->pool->active, 0))
 			{
-				/*
-				 * Restore unprocessed job - required for suspend/resume.
-				 * Decrementing the read position doesn't mean the job was
-				 * lost, it just means this thread is giving up ownership
-				 * for this particular read position. When the pool is
-				 * resumed, the pending jobs will be picked up again.
-				 */
-				__sync_fetch_and_sub(&worker->ring_buffer.read_pos, 1);
-
 				break; /* exits the loop and terminates this thread */
 			}
 		}
@@ -464,7 +425,7 @@ thread_pool_worker(struct thread_pool_worker_t* worker)
 
 		/* job done, flag as free slot */
 		__sync_sub_and_fetch(&worker->pool->active_jobs, 1);
-		__sync_bool_compare_and_swap(flag_ptr, FLAG_READ_IN_PROGRESS, FLAG_FREE_SLOT);
+		__sync_lock_test_and_set(flag_ptr, FLAG_FREE_SLOT);
 	}
 
 	/* wake up any threads waiting for job completion */

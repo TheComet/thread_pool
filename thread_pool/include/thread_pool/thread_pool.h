@@ -19,10 +19,10 @@ typedef void* (*thread_pool_yield_param_func)(int);
  */
 struct ring_buffer_t
 {
-	intptr_t job_slots;
-	intptr_t job_size_in_bytes;
-	intptr_t write_pos;
-	intptr_t read_pos;
+	uintptr_t job_slots;
+	uintptr_t job_size_in_bytes;
+	uintptr_t write_pos;
+	uintptr_t read_pos;
 	DATA_POINTER_TYPE* obj_buffer;
 	DATA_POINTER_TYPE* flg_buffer;
 };
@@ -41,23 +41,12 @@ struct ring_buffer_t
  * + FLAG_FILLED_SLOT       : The corresponding read/write position contains
  *                            data ready for reading. Before reading data, the
  *                            flag must be changed to FLAG_READ_IN_PROGRESS.
- * + FLAG_READ_IN_PROGRESS  : The corresponding read/write position is currently
- *                            being read from. Once reading is complete, the
- *                            flag must be changed back to FLAG_FREE_SLOT so it
- *                            can be written to again.
- * + FLAG_INVALID_JOB       : The corresponding read/write position has been
- *                            skipped and the data that exists at this location
- *                            is garbage. This flag will be set when a ring
- *                            buffer overflows and the job is executed by the
- *                            inserting thread instead.
  */
 typedef enum ring_buffer_flags_e
 {
 	FLAG_FREE_SLOT = 0,
 	FLAG_WRITE_IN_PROGRESS = 1,
 	FLAG_FILLED_SLOT = 2,
-	FLAG_READ_IN_PROGRESS = 3,
-	FLAG_INVALID_JOB = 4
 } ring_buffer_flags_e;
 
 typedef enum thread_pool_policy_e
@@ -69,26 +58,26 @@ typedef enum thread_pool_policy_e
 struct thread_pool_t;
 struct thread_pool_worker_t
 {
-	int                   timer;       /* counters for each thread - used for work balancing - use atomics to modify */
-	pthread_t             thread;      /* vector of worker thread handles */
-	pthread_mutex_t       mutex;       /* worker mutex for wakeup condition */
-	pthread_cond_t        wakeup_cv;   /* condition variables for waking up a worker thread - lock worker_mutex for access */
-	struct ring_buffer_t  ring_buffer; /* ring buffers for storing jobs, 1 for each thread */
-	struct thread_pool_t* pool;        /* the pool that owns this worker */
+	pthread_t             thread;        /* thread handle */
+	pthread_mutex_t       mutex;         /* worker mutex for wakeup condition */
+	pthread_cond_t        wakeup_cv;     /* condition variables for waking up a worker thread - lock worker_mutex for access */
+	struct ring_buffer_t  ring_buffer;   /* ring buffer for storing jobs, 1 for each thread */
+	struct thread_pool_t* pool;          /* the pool that owns this worker */
 };
 
 struct thread_pool_t
 {
-	int             num_threads;        /* number of worker threads to spawn on resume */
-	int             active_jobs;        /* number of active jobs - use atomics to modify */
-	int             selected_worker;    /* index of the worker to give an incoming job - NOTE: doesn't wrap, use modulo - use atomics to modify */
-	char            active;             /* whether or not the pool is active - use atomics to modify */
-	char            never_sleep;        /* when non-zero, idle workers will spinlock */
+	int             num_threads;         /* number of worker threads to spawn on resume */
+	int             active_jobs;         /* number of active jobs - use atomics to modify */
+	int             selected_worker;     /* index of the worker to give an incoming job - NOTE: doesn't wrap, use modulo - use atomics to modify */
+	char            active;              /* whether or not the pool is active - use atomics to modify */
+	char            never_sleep;         /* when non-zero, idle workers will spinlock */
 
-	struct thread_pool_worker_t* worker;/* vector of workers */
+	struct thread_pool_worker_t* worker; /* vector of workers */
 
-	pthread_mutex_t mutex;              /* pool mutex - used for active_jobs and signalling completed jobs */
-	pthread_cond_t  job_finished_cv;    /* condition variable for waking up threads waiting on finished jobs - lock mutex for access */
+	pthread_spinlock_t queue_lock;       /* used to safely increment write_pos when queuing a job */
+	pthread_mutex_t    mutex;            /* pool mutex - used for active_jobs and signalling completed jobs */
+	pthread_cond_t     job_finished_cv;  /* condition variable for waking up threads waiting on finished jobs - lock mutex for access */
 };
 
 struct thread_pool_job_t
